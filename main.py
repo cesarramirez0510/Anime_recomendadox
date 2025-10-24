@@ -72,8 +72,7 @@ def build_user_item_matrix(anime: pd.DataFrame,
 
 
 def cosine_item_item(M: csr_matrix):
-    """Calcula similitud coseno entre ítems usando matriz dispersa."""
-    print("🔄 Calculando similitudes item-item...")
+    print("Calculando similitudes item-item...")
     
     S = cosine_similarity(M.T, dense_output=False)
     
@@ -86,7 +85,6 @@ def cosine_item_item(M: csr_matrix):
 
 
 def find_anime_id_by_name(anime_df: pd.DataFrame, name: str):
-    """Busca un anime por nombre (exacto o parcial)."""
     n = name.strip().lower()
     exact = anime_df[anime_df['name'].str.lower() == n]
     if not exact.empty:
@@ -103,7 +101,6 @@ def top_similar_to_title(title: str,
                          S: csr_matrix,
                          id_to_name: dict,
                          k: int = 10) -> pd.DataFrame:
-    """Encuentra los k animes más similares a un título dado."""
     aid = find_anime_id_by_name(anime_df, title)
     if aid is None:
         raise ValueError(f" No encontré '{title}' en anime.csv.")
@@ -135,7 +132,6 @@ def recommend_for_user(user_id: int,
                        S: csr_matrix,
                        id_to_name: dict,
                        k: int = 10) -> pd.DataFrame:
-    """Recomienda k ítems para un usuario basado en filtrado colaborativo."""
     if user_id not in user_ids:
         raise ValueError(f"Usuario {user_id} no encontrado en rating.csv (o quedó filtrado).")
     
