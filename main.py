@@ -1,148 +1,147 @@
-import argparse
 import pandas as pd
 import numpy as np
-from scipy.sparse import csr_matrix
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 
+ANIME_CSV = "anime.csv"
+RATINGS_CSV = "rating.csv"
+
+ACTION = "similar_to"      
+SIMILAR_TO_TITLE = "Naruto"    
+TARGET_USER_ID = 1             
+TOP_K = 10                     
+MIN_RATINGS_PER_ITEM = 5      
 
 def load_data(anime_path: str, ratings_path: str):
-    anime_cols = ['anime_id','name','genre','type','episodes','rating','members']
-    rating_cols = ['user_id','anime_id','rating']
+    """Carga CSVs del dataset de Kaggle y limpia ratings -1."""
+    anime_cols = ['anime_id', 'name', 'genre', 'type', 'episodes', 'rating', 'members']
+    rating_cols = ['user_id', 'anime_id', 'rating']
 
     anime = pd.read_csv(anime_path, names=anime_cols, header=0)
     ratings = pd.read_csv(ratings_path, names=rating_cols, header=0)
 
-    ratings = ratings[ratings['rating'] != -1].copy()
 
-    anime['name_norm'] = anime['name'].str.strip().str.lower()
+    ratings = ratings[ratings['rating'] != -1].copy()
 
     return anime, ratings
 
-def build_item_user_matrix(anime, ratings, min_ratings_per_item=5):
-    item_counts = ratings['anime_id'].value_counts()
-    keep_items = item_counts[item_counts >= min_ratings_per_item].index
-    ratings_f = ratings[ratings['anime_id'].isin(keep_items)].copy()
 
-    unique_items = np.sort(ratings_f['anime_id'].unique())
-    unique_users = np.sort(ratings_f['user_id'].unique())
+def build_user_item_matrix(anime: pd.DataFrame,
+                           ratings: pd.DataFrame,
+                           min_ratings_per_item: int = 5):
+    
+    if min_ratings_per_item > 1:
+        counts = ratings['anime_id'].value_counts()
+        keep = counts[counts >= min_ratings_per_item].index
+        ratings = ratings[ratings['anime_id'].isin(keep)].copy()
 
-    item_to_idx = {aid:i for i, aid in enumerate(unique_items)}
-    user_to_idx = {uid:i for i, uid in enumerate(unique_users)}
+    ui = ratings.pivot_table(index='user_id',
+                             columns='anime_id',
+                             values='rating',
+                             aggfunc='mean',
+                             fill_value=0)
 
-    rows = ratings_f['anime_id'].map(item_to_idx).values
-    cols = ratings_f['user_id'].map(user_to_idx).values
-    vals = ratings_f['rating'].astype(float).values
+    M = ui.values.astype(float)
+    user_ids = ui.index.values
+    item_ids = ui.columns.values
 
-    user_means = pd.Series(vals, index=cols).groupby(level=0).mean()
-    centered_vals = vals - user_means[cols].values
+    id_to_name = anime.set_index('anime_id')['name'].to_dict()
 
-    mat = csr_matrix((centered_vals, (rows, cols)),
-                     shape=(len(unique_items), len(unique_users)))
+    return M, user_ids, item_ids, id_to_name
 
-    meta = anime[anime['anime_id'].isin(unique_items)].copy()
-    meta = meta.set_index('anime_id').loc[unique_items].reset_index()
 
-    return mat, meta, item_to_idx
+def cosine_item_item(M: np.ndarray):
+    norms = np.linalg.norm(M, axis=0)
+    norms[norms == 0] = 1e-9 
+    
+    S = (M.T @ M) / np.outer(norms, norms)
+    np.fill_diagonal(S, 0.0)  # no queremos recomendarnos a nosotros mismos
+    return S
 
-def build_content_similarity(meta):
-    genres = meta['genre'].fillna('').astype(str).values
-    tfidf = TfidfVectorizer(token_pattern=r'[^,\s]+' , lowercase=True)
-    G = tfidf.fit_transform(genres)
-    sim_content = cosine_similarity(G, dense_output=False)  # sparse
-    return sim_content
 
-def build_collab_similarity(item_user_mat):
-    sim = cosine_similarity(item_user_mat, dense_output=False)
-    return sim
+def find_anime_id_by_name(anime_df: pd.DataFrame, name: str):
+    n = name.strip().lower()
+    exact = anime_df[anime_df['name'].str.lower() == n]
+    if not exact.empty:
+        return int(exact.iloc[0]['anime_id'])
+    contains = anime_df[anime_df['name'].str.lower().str.contains(n, na=False)]
+    if not contains.empty:
+        return int(contains.iloc[0]['anime_id'])
+    return None
 
-def fuse_similarities(sim_collab, sim_content=None, alpha=1.0):
-    if sim_content is None:
-        return sim_collab
-    return (sim_collab.multiply(alpha)) + (sim_content.multiply(1 - alpha))
 
-def top_similar_items(anime_name, meta, sim_matrix, top_k=10):
-    name_norm = anime_name.strip().lower()
-    idx_series = meta['name_norm'] if 'name_norm' in meta else meta['name'].str.lower()
-    matches = np.where(idx_series.values == name_norm)[0]
-    if len(matches) == 0:
-        contains = np.where(idx_series.str.contains(name_norm, regex=False).values)[0]
-        if len(contains) == 0:
-            raise ValueError(f"No encontré el animé: {anime_name}")
-        target_idx = contains[0]
-    else:
-        target_idx = matches[0]
+def top_similar_to_title(title: str,
+                         anime_df: pd.DataFrame,
+                         item_ids: np.ndarray,
+                         S: np.ndarray,
+                         id_to_name: dict,
+                         k: int = 10) -> pd.DataFrame:
+    aid = find_anime_id_by_name(anime_df, title)
+    if aid is None:
+        raise ValueError(f"No encontré '{title}' en anime.csv.")
+    if aid not in item_ids:
+        raise ValueError(f"'{title}' existe pero fue filtrado por MIN_RATINGS_PER_ITEM. "
+                         f"Baja ese valor o elige otro título.")
+    j = int(np.where(item_ids == aid)[0][0])
+    sims = S[j]
+    top_idx = np.argsort(-sims)[:k]
+    rows = []
+    for idx in top_idx:
+        aid2 = int(item_ids[idx])
+        rows.append({
+            "anime_id": aid2,
+            "name": id_to_name.get(aid2, str(aid2)),
+            "similarity": float(sims[idx])
+        })
+    return pd.DataFrame(rows)
 
-    sims = sim_matrix.getrow(target_idx).toarray().ravel()
-    sims[target_idx] = -np.inf  # excluir el mismo item
-    top_idx = np.argpartition(-sims, range(top_k))[:top_k]
-    top_idx = top_idx[np.argsort(-sims[top_idx])]
 
-    return meta.iloc[top_idx][['anime_id','name','genre']].assign(similarity=sims[top_idx])
+def recommend_for_user(user_id: int,
+                       M: np.ndarray,
+                       user_ids: np.ndarray,
+                       item_ids: np.ndarray,
+                       S: np.ndarray,
+                       id_to_name: dict,
+                       k: int = 10) -> pd.DataFrame:
+    if user_id not in user_ids:
+        raise ValueError(f"Usuario {user_id} no encontrado en rating.csv (o quedó filtrado).")
+    i = int(np.where(user_ids == user_id)[0][0])
+    r = M[i] 
 
-def recommend_for_user(user_id, ratings, meta, sim_matrix, top_k=10, min_seen=1):
-    seen = ratings[ratings['user_id'] == user_id]
-    seen = seen[seen['rating'] != -1]
-    if len(seen) < min_seen:
-        raise ValueError(f"El usuario {user_id} tiene muy pocos ítems valorados.")
+    scores = S @ r
 
-    aid_to_idx = {aid:i for i, aid in enumerate(meta['anime_id'].values)}
-    seen = seen[seen['anime_id'].isin(aid_to_idx.keys())].copy()
-    if seen.empty:
-        raise ValueError("El usuario no coincide con los items de la matriz (tras filtrado).")
+    seen = r > 0
+    scores[seen] = -np.inf
 
-    scores = np.zeros(len(meta), dtype=float)
-    seen_pairs = [(aid_to_idx[aid], r) for aid, r in zip(seen['anime_id'], seen['rating'])]
-
-    for idx, r in seen_pairs:
-        sims = sim_matrix.getrow(idx).toarray().ravel()
-        scores += sims * float(r)
-
-    seen_idx = [aid_to_idx[aid] for aid in seen['anime_id']]
-    scores[seen_idx] = -np.inf
-
-    top_idx = np.argpartition(-scores, range(top_k))[:top_k]
-    top_idx = top_idx[np.argsort(-scores[top_idx])]
-    return meta.iloc[top_idx][['anime_id','name','genre']].assign(score=scores[top_idx])
+    top_idx = np.argsort(-scores)[:k]
+    rows = []
+    for idx in top_idx:
+        aid = int(item_ids[idx])
+        rows.append({
+            "anime_id": aid,
+            "name": id_to_name.get(aid, str(aid)),
+            "score": float(scores[idx])
+        })
+    return pd.DataFrame(rows)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Recomendador de animé basado en items (Kaggle).")
-    parser.add_argument("--anime_csv", default="anime.csv")
-    parser.add_argument("--ratings_csv", default="rating.csv")
-    parser.add_argument("--alpha", type=float, default=1.0,
-                        help="Peso de similitud colaborativa (1.0=solo ratings, 0.0=solo géneros).")
-    parser.add_argument("--topk", type=int, default=10)
-    parser.add_argument("--user_id", type=int, default=None,
-                        help="Si se pasa, devuelve recomendaciones para este usuario.")
-    parser.add_argument("--similar_to", type=str, default=None,
-                        help="Si se pasa, devuelve ítems similares a este título (búsqueda exacta o contiene).")
-    parser.add_argument("--min_ratings_per_item", type=int, default=5)
-    args = parser.parse_args()
-
-    anime, ratings = load_data(args.anime_csv, args.ratings_csv)
-
-    item_user_mat, meta, item_to_idx = build_item_user_matrix(
-        anime, ratings, min_ratings_per_item=args.min_ratings_per_item
+    anime, ratings = load_data(ANIME_CSV, RATINGS_CSV)
+    M, user_ids, item_ids, id_to_name = build_user_item_matrix(
+        anime, ratings, min_ratings_per_item=MIN_RATINGS_PER_ITEM
     )
+    S = cosine_item_item(M)
 
-    sim_collab = build_collab_similarity(item_user_mat)
-    sim_content = build_content_similarity(meta)
-
-    sim_fused = fuse_similarities(sim_collab, sim_content, alpha=args.alpha)
-
-    if args.similar_to:
-        out = top_similar_items(args.similar_to, meta, sim_fused, top_k=args.topk)
-        print("\n=== Ítems similares ===")
+    if ACTION == "similar_to":
+        out = top_similar_to_title(SIMILAR_TO_TITLE, anime, item_ids, S, id_to_name, k=TOP_K)
+        print("\n=== ÍTEMS SIMILARES ===")
         print(out.to_string(index=False))
-    elif args.user_id is not None:
-        out = recommend_for_user(args.user_id, ratings, meta, sim_fused, top_k=args.topk)
-        print("\n=== Recomendaciones para usuario ===")
+    elif ACTION == "recommend_for_user":
+        out = recommend_for_user(TARGET_USER_ID, M, user_ids, item_ids, S, id_to_name, k=TOP_K)
+        print("\n=== RECOMENDACIONES PARA USUARIO ===")
         print(out.to_string(index=False))
     else:
-        merged = pd.merge(anime[['anime_id','name']], ratings, on='anime_id')
-        print(merged.head())
+        print("ACTION debe ser 'similar_to' o 'recommend_for_user'.")
+
 
 if __name__ == "__main__":
     main()
